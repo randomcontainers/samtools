@@ -1,0 +1,218 @@
+name: samtools
+title: Samtools
+summary: Sorts, indexes, views and converts aligned sequencing reads in SAM, BAM and CRAM files, with bgzip, tabix and htsfile from HTSlib.
+homepage: https://www.htslib.org/
+# Samtools and HTSlib are MIT. HTSlib's cram/ directory, htscodecs and the
+# Staden Package code in bam_consensus.c are BSD-3-Clause, and lz4 (used for
+# temporary files) is BSD-2-Clause. htscodecs' rANS_byte.h and rANS_word.h
+# (from ryg_rans) are CC0; md5.c, the date code in hts_time_funcs.h and
+# htscodecs' c_range_coder.h are public domain.
+license: MIT AND BSD-3-Clause AND BSD-2-Clause AND CC0-1.0 AND LicenseRef-Public-Domain
+upstream:
+  source: github-release
+  repository: samtools/samtools
+  # Release tags look like 1.24 and 1.23.2. Point releases of older series
+  # are sometimes published after a newer release; only versions newer than
+  # the current one are picked up.
+  tag-pattern: '^(1\.\d+(?:\.\d+)?)$'
+  version-template: '{1}'
+  versioning: semver
+  version: "1.24"
+  # The release tarball bundles HTSlib; the "Source code" archives do not.
+  # Upstream publishes no checksums or signatures, so the reconciler pins
+  # the digest GitHub records for the release asset.
+  artifact:
+    url: https://github.com/samtools/samtools/releases/download/{version}/samtools-{version}.tar.bz2
+    sha256: 89b2a440123eeaa400392ce1736e7d60ce9041843027d76819753c5a8246bfdd
+image:
+  entrypoint: [samtools]
+  cmd: [--help]
+test:
+  - |
+    samtools --version > version.txt
+    if [ "$(head -n 1 version.txt)" != "samtools $VERSION" ]; then
+      cat version.txt >&2; echo "expected samtools $VERSION" >&2; exit 1
+    fi
+    # The bundled HTSlib has its own version number, which can differ from VERSION.
+    hts=$(sed -n 's/^Using htslib //p' version.txt)
+    if ! printf '%s\n' "$hts" | grep -Eqx '1\.[0-9]+(\.[0-9]+)?'; then
+      cat version.txt >&2; echo 'expected a "Using htslib" line' >&2; exit 1
+    fi
+    for f in 'curses=yes' 'libcurl=yes S3=yes GCS=yes libdeflate=yes lzma=yes bzip2=yes plugins=no'; do
+      grep -Fq "$f" version.txt || { cat version.txt >&2; echo "expected the features $f" >&2; exit 1; }
+    done
+    for tool in htsfile annot-tsv; do
+      "$tool" --version > "$tool.txt"
+      if [ "$(head -n 1 "$tool.txt")" != "$tool (htslib) $hts" ]; then
+        cat "$tool.txt" >&2; echo "expected $tool from HTSlib $hts" >&2; exit 1
+      fi
+    done
+    # Images that add BCFtools have its bgzip and tabix, which can come from
+    # another HTSlib release.
+    for tool in bgzip tabix; do
+      "$tool" --version > "$tool.txt"
+      if ! head -n 1 "$tool.txt" | grep -Eqx "$tool \(htslib\) 1\.[0-9]+(\.[0-9]+)?"; then
+        cat "$tool.txt" >&2; echo "expected $tool from HTSlib" >&2; exit 1
+      fi
+    done
+    # Without libcurl, HTSlib rejects the URL with "Protocol not supported"
+    # instead of trying to connect.
+    if HTS_RETRY_MAX=0 htsfile http://127.0.0.1:9/none.bam > http.txt 2>&1 \
+      || ! grep -Fq "can't open" http.txt || grep -Fq 'not supported' http.txt; then
+      cat http.txt >&2; echo 'expected htsfile to fail connecting to 127.0.0.1:9' >&2; exit 1
+    fi
+  - |
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    c1=GATCCTAGGCTTACGATCGGTACCATGCAAGTCTGATCGTAGCTAGGCTTACCGATGCAT
+    c2=TTGACCGTAAGCTAGCATCGATCGGATCCATGCAAGTTCGAGCTAGCTAACGTTAGCCAT
+    printf '>chr1\n%s\n>chr2\n%s\n' "$c1" "$c2" > ref.fa
+    samtools faidx ref.fa
+    printf 'chr1\t60\t6\t60\t61\nchr2\t60\t73\t60\t61\n' > expected.txt
+    cmp expected.txt ref.fa.fai || { cat ref.fa.fai >&2; exit 1; }
+    samtools faidx ref.fa chr2:11-20 > region.fa
+    printf '>chr2:11-20\n%s\n' "$(printf '%s' "$c2" | cut -c 11-20)" > expected.txt
+    cmp expected.txt region.fa || { cat region.fa >&2; exit 1; }
+    # Four 20 bp reads that match the reference and one unmapped read, out of order.
+    aln() {
+      printf '%s\t%s\t%s\t%s\t60\t20M\t*\t0\t0\t%s\tIIIIIIIIIIIIIIIIIIII\n' \
+        "$1" "$2" "$3" "$4" "$(printf '%s' "$5" | cut -c "$4-$(($4 + 19))")"
+    }
+    {
+      printf '@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:60\n@SQ\tSN:chr2\tLN:60\n'
+      aln r1 0 chr2 31 "$c2"
+      aln r2 0 chr1 41 "$c1"
+      aln r3 0 chr1 1 "$c1"
+      aln r4 16 chr2 1 "$c2"
+      printf 'r5\t4\t*\t0\t0\t*\t*\t0\t0\tACGTACGTAC\tIIIIIIIIII\n'
+    } > reads.sam
+    samtools sort -@ 2 -o sorted.bam reads.sam
+    samtools quickcheck sorted.bam
+    samtools view -o sorted.sam sorted.bam
+    cut -f 1-4 sorted.sam > order.txt
+    printf 'r3\t0\tchr1\t1\nr2\t0\tchr1\t41\nr4\t16\tchr2\t1\nr1\t0\tchr2\t31\nr5\t4\t*\t0\n' > expected.txt
+    cmp expected.txt order.txt || { cat order.txt >&2; exit 1; }
+    samtools index sorted.bam
+    samtools idxstats sorted.bam > idxstats.txt
+    printf 'chr1\t60\t2\t0\nchr2\t60\t2\t0\n*\t0\t0\t1\n' > expected.txt
+    cmp expected.txt idxstats.txt || { cat idxstats.txt >&2; exit 1; }
+    same "$(samtools view -c sorted.bam chr1:30-60)" 1 'reads in chr1:30-60'
+    same "$(samtools view -c sorted.bam chr2)" 2 'reads in chr2'
+    samtools flagstat sorted.bam > flagstat.txt
+    if ! grep -Fxq '5 + 0 in total (QC-passed reads + QC-failed reads)' flagstat.txt \
+      || ! grep -q '^4 + 0 mapped (' flagstat.txt; then
+      cat flagstat.txt >&2; echo 'expected 5 reads, 4 of them mapped' >&2; exit 1
+    fi
+  - |
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    # CRAM 3.1 with the bzip2 and lzma codecs allowed, decoded against the same
+    # reference. CRAM does not keep optional tags as they were, so only the 11
+    # mandatory SAM fields are compared.
+    samtools view -C -T ref.fa --output-fmt-option use_bzip2=1 --output-fmt-option use_lzma=1 \
+      -o reads.cram sorted.bam
+    htsfile sorted.bam reads.cram > formats.txt
+    printf 'sorted.bam:\tBAM version 1 compressed sequence data\nreads.cram:\tCRAM version 3.1 compressed sequence data\n' > expected.txt
+    cmp expected.txt formats.txt || { cat formats.txt >&2; exit 1; }
+    samtools index reads.cram
+    samtools view -T ref.fa -o from-cram.sam reads.cram
+    cut -f 1-11 sorted.sam > bam-fields.txt
+    cut -f 1-11 from-cram.sam > cram-fields.txt
+    cmp bam-fields.txt cram-fields.txt || { echo expected: >&2; cat bam-fields.txt >&2; echo got: >&2; cat cram-fields.txt >&2; exit 1; }
+    same "$(samtools view -c -T ref.fa reads.cram chr2:25-40)" 1 'reads in chr2:25-40 of reads.cram'
+  - |
+    c1=GATCCTAGGCTTACGATCGGTACCATGCAAGTCTGATCGTAGCTAGGCTTACCGATGCAT
+    c2=TTGACCGTAAGCTAGCATCGATCGGATCCATGCAAGTTCGAGCTAGCTAACGTTAGCCAT
+    samtools depth -a -r chr1 sorted.bam > depth.txt
+    awk '$2 == 10 || $2 == 30 || $2 == 50' depth.txt > some-depths.txt
+    printf 'chr1\t10\t1\nchr1\t30\t0\nchr1\t50\t1\n' > expected.txt
+    cmp expected.txt some-depths.txt || { cat some-depths.txt >&2; exit 1; }
+    # -B turns off BAQ, which would otherwise lower the printed base qualities.
+    samtools mpileup -B -f ref.fa -r chr1:50-50 -o pileup1.txt sorted.bam
+    samtools mpileup -B -f ref.fa -r chr2:10-10 -o pileup2.txt sorted.bam
+    cat pileup1.txt pileup2.txt > pileup.txt
+    printf 'chr1\t50\t%s\t1\t.\tI\nchr2\t10\t%s\t1\t,\tI\n' \
+      "$(printf '%s' "$c1" | cut -c 50)" "$(printf '%s' "$c2" | cut -c 10)" > expected.txt
+    cmp expected.txt pileup.txt || { echo expected: >&2; cat expected.txt >&2; echo got: >&2; cat pileup.txt >&2; exit 1; }
+    # tview's text mode prints the reference above the reads.
+    samtools tview -d T -w 60 -p chr1:1 sorted.bam ref.fa > tview.txt
+    grep -Fq "$c1" tview.txt || { cat tview.txt >&2; echo 'expected the chr1 reference in the tview output' >&2; exit 1; }
+  - |
+    printf 'chr1\t10\t20\tfirst\nchr1\t30\t40\tsecond\nchr2\t5\t15\tthird\n' > regions.bed
+    bgzip -c regions.bed > regions.bed.gz
+    bgzip -dc regions.bed.gz > back.bed
+    cmp regions.bed back.bed
+    tabix -p bed regions.bed.gz
+    tabix regions.bed.gz chr1:25-35 > hits.bed
+    printf 'chr1\t30\t40\tsecond\n' > expected.txt
+    cmp expected.txt hits.bed || { cat hits.bed >&2; exit 1; }
+    # annot-tsv without -f prints the target lines that overlap a source region.
+    printf 'chr1\t15\t25\n' > source.tsv
+    printf 'chr1\t1\t5\ta\nchr1\t20\t30\tb\nchr2\t15\t25\tc\n' > target.tsv
+    annot-tsv -c 1,2,3 -s source.tsv -t target.tsv -o overlaps.tsv
+    sed '/^#/d' overlaps.tsv > overlaps.txt
+    printf 'chr1\t20\t30\tb\n' > expected.txt
+    cmp expected.txt overlaps.txt || { cat overlaps.tsv >&2; exit 1; }
+examples:
+  - title: Sort a SAM or BAM file by coordinate and index it
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/samtools sort -o sorted.bam --write-index in.bam
+  - title: Print the reads of a region as SAM
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/samtools view sorted.bam chr1:10000-20000
+  - title: Convert BAM to CRAM against a reference
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/samtools view -C -T ref.fa -o out.cram sorted.bam
+  - title: Count reads by mapping status and flags
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/samtools flagstat sorted.bam
+  - title: Compress and index a BED file with bgzip and tabix
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/samtools -c 'bgzip regions.bed && tabix -p bed regions.bed.gz'
+combos:
+  - with: [bcftools]
+    default: true
+    base: samtools
+    summary: Samtools with BCFtools, for sorting and indexing aligned reads and calling variants from them.
+    test:
+      - |
+        # Both packages ship bgzip and tabix, and bcftools' copies replace the
+        # samtools ones in this image. Each tool must report the HTSlib of the
+        # package it is taken from. That tells the copies apart only while the
+        # two bundled HTSlib releases differ, which happens when one project
+        # publishes a point release before the other.
+        samtools --version > samtools-version.txt
+        bcftools --version > bcftools-version.txt
+        s=$(sed -n 's/^Using htslib //p' samtools-version.txt)
+        b=$(sed -n 's/^Using htslib //p' bcftools-version.txt)
+        if [ -z "$s" ] || [ -z "$b" ]; then
+          cat samtools-version.txt bcftools-version.txt >&2; echo 'expected two "Using htslib" lines' >&2; exit 1
+        fi
+        echo "samtools uses HTSlib $s, bcftools uses HTSlib $b"
+        check() {
+          "$1" --version > "$1-version.txt"
+          if [ "$(head -n 1 "$1-version.txt")" != "$1 (htslib) $2" ]; then
+            cat "$1-version.txt" >&2; echo "expected $1 from HTSlib $2" >&2; exit 1
+          fi
+        }
+        check bgzip "$b"
+        check tabix "$b"
+        check htsfile "$s"
+        check annot-tsv "$s"
+      - |
+        # Ten reads over a 60 bp reference, all with C in place of the A at 30,
+        # written in reverse order so that samtools has to sort them.
+        ref=GATCCTAGGCTTACGATCGGTACCATGCAAGTCTGATCGTAGCTAGGCTTACCGATGCAT
+        alt="$(printf '%s' "$ref" | cut -c 1-29)C$(printf '%s' "$ref" | cut -c 31-60)"
+        printf '>chr1\n%s\n' "$ref" > ref.fa
+        qual=$(printf '%30s' '' | tr ' ' I)
+        {
+          printf '@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:60\n@RG\tID:rg1\tSM:sample1\n'
+          start=15
+          while [ "$start" -ge 6 ]; do
+            seq=$(printf '%s' "$alt" | cut -c "$start-$((start + 29))")
+            printf 'read%s\t0\tchr1\t%s\t60\t30M\t*\t0\t0\t%s\t%s\tRG:Z:rg1\n' "$start" "$start" "$seq" "$qual"
+            start=$((start - 1))
+          done
+        } > reads.sam
+        samtools faidx ref.fa
+        samtools sort -o reads.bam --write-index reads.sam
+        bcftools mpileup -f ref.fa -Ou -o pileup.bcf reads.bam
+        bcftools call -mv -Oz -o calls.vcf.gz pileup.bcf
+        tabix -p vcf calls.vcf.gz
+        bcftools query -r chr1:30 -f '%CHROM %POS %REF %ALT [%GT]\n' calls.vcf.gz > calls.txt
+        printf 'chr1 30 A C 1/1\n' > expected.txt
+        cmp expected.txt calls.txt || { echo expected: >&2; cat expected.txt >&2; echo got: >&2; cat calls.txt >&2; exit 1; }
