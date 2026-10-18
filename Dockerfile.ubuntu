@@ -1,0 +1,185 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's own packages are recorded first so they can be left out of
+# runtime-deps; every image built from this list starts from the same base.
+# perl runs the test suites, which need File::Temp from the full perl package.
+# python3 runs the local HTTP server for HTSlib's libcurl tests, which are
+# skipped without it.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      bzip2 \
+      ca-certificates \
+      curl \
+      libbz2-dev \
+      libcurl4-openssl-dev \
+      libdeflate-dev \
+      liblzma-dev \
+      libncurses-dev \
+      libssl-dev \
+      perl \
+      pkgconf \
+      python3 \
+      zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+ARG VERSION
+ARG SOURCE_SHA256
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '1\.[0-9]+(\.[0-9]+)?' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_SHA256}" | grep -Eqx '[0-9a-f]{64}' \
+      || { echo "SOURCE_SHA256 must be the tarball's sha256" >&2; exit 1; }; \
+    url="https://github.com/samtools/samtools/releases/download/${VERSION}/samtools-${VERSION}.tar.bz2"; \
+    curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 -o /tmp/samtools.tar.bz2 "$url"; \
+    echo "${SOURCE_SHA256}  /tmp/samtools.tar.bz2" | sha256sum -c -; \
+    mkdir /src; \
+    tar -xjf /tmp/samtools.tar.bz2 -C /src --strip-components=1; \
+    rm /tmp/samtools.tar.bz2; \
+    echo "$url" > /tmp/source-url
+
+# configure also configures the bundled HTSlib, which is linked in
+# statically. Remote files (http, https, S3, Google Cloud Storage),
+# libdeflate and ncursesw for tview are requested explicitly, so configure
+# fails instead of leaving them out. ref-cache, HTSlib's caching proxy for
+# CRAM references, is a server and stays out. all-htslib builds bgzip,
+# tabix, htsfile and annot-tsv, and the two check targets run the samtools
+# and HTSlib test suites.
+ARG JOBS
+WORKDIR /src
+RUN ./configure \
+      --prefix=/usr/local \
+      --with-ncursesw \
+      --enable-libcurl \
+      --enable-gcs \
+      --enable-s3 \
+      --with-libdeflate \
+      --disable-ref-cache; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make -j"${JOBS:-$(nproc)}" all-htslib; \
+    make check; \
+    make check-htslib
+
+ARG BASE_IMAGE
+# The bundled HTSlib does not always have the samtools version (samtools
+# 1.19.2 came with HTSlib 1.19.1), so its directory is found with a glob.
+# The scripts make install puts next to the programs need perl, python3 or
+# gnuplot, which the image does not have, so every file in bin that is not
+# an ELF executable is removed. NOTICES takes from each C file its first
+# comment (a /* */ block or a run of // lines) with a copyright line, if
+# a copyright line in it, or a line right below one that starts with a
+# year (as in misc/wgsim.c), names a holder other than Genome Research.
+# runtime-deps lists the packages that own the libraries the programs
+# load, minus the base image's packages, plus the packages in
+# runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    set -- htslib-*/; \
+    if [ "$#" -ne 1 ] || [ ! -d "$1" ]; then echo "expected one bundled htslib directory: $*" >&2; exit 1; fi; \
+    hts=${1%/}; \
+    found=; \
+    missing=; \
+    for d in HAVE_LIBCURL ENABLE_GCS ENABLE_S3 HAVE_HMAC HAVE_LIBDEFLATE HAVE_LIBBZ2 HAVE_LIBLZMA; do \
+      if grep -q "^#define $d 1" "$hts/config.h"; then found="$found $d"; else missing="$missing $d"; fi; \
+    done; \
+    for d in HAVE_CURSES HAVE_NCURSESW; do \
+      if grep -q "^#define $d 1" config.h; then found="$found $d"; else missing="$missing $d"; fi; \
+    done; \
+    if [ -n "$missing" ]; then echo "samtools or HTSlib was configured without:$missing" >&2; exit 1; fi; \
+    make install DESTDIR=/out; \
+    rm -rf /out/usr/local/share/man; \
+    for f in /out/usr/local/bin/*; do \
+      if [ "$(head -c 4 "$f" | tail -c 3)" != ELF ]; then rm "$f"; fi; \
+    done; \
+    install -m 755 "$hts/annot-tsv" "$hts/bgzip" "$hts/htsfile" "$hts/tabix" /out/usr/local/bin/; \
+    strip --strip-unneeded /out/usr/local/bin/*; \
+    /out/usr/local/bin/samtools --version > /tmp/samtools-version; \
+    if [ "$(head -n 1 /tmp/samtools-version)" != "samtools ${VERSION}" ]; then \
+      cat /tmp/samtools-version >&2; echo "expected samtools ${VERSION}" >&2; exit 1; \
+    fi; \
+    meta=/out/usr/local/share/randomcontainers/samtools; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/LICENSE"; \
+    cp "$hts/LICENSE" "$meta/licenses/LICENSE.htslib"; \
+    cp "$hts/htscodecs/LICENSE.md" "$meta/licenses/LICENSE.htscodecs.md"; \
+    cp lz4/LICENSE "$meta/licenses/LICENSE.lz4"; \
+    awk '/^Modified BSD license for any legacy components/ { p = 1 } p && /^\*\// { exit } p' bam_consensus.c \
+      > "$meta/licenses/LICENSE.staden"; \
+    if ! grep -q 'MEDICAL RESEARCH COUNCIL' "$meta/licenses/LICENSE.staden" \
+      || ! grep -q 'POSSIBILITY OF SUCH DAMAGE' "$meta/licenses/LICENSE.staden"; then \
+      echo 'could not cut the Staden Package license from bam_consensus.c' >&2; exit 1; \
+    fi; \
+    find . \( -name test -o -name tests -o -name fuzz \) -prune -o -name '*.[ch]' -print | LC_ALL=C sort > /tmp/sources; \
+    while read -r f; do \
+      awk -v f="${f#./}" ' \
+        function check() { \
+          s = 0; \
+          if (b ~ /[Cc]opyright/) { \
+            n = split(b, l, "\n"); \
+            h = 0; \
+            for (i = 1; i <= n; i++) { \
+              h = (l[i] ~ /[Cc]opyright (\([Cc]\) )?[0-9A-Z]/) || (h && l[i] ~ /^[^0-9A-Za-z]*[0-9][0-9][0-9][0-9]/); \
+              if (h && l[i] !~ /Genome Research/) { printf "==> %s <==\n%s\n", f, b; exit } \
+            } \
+            exit; \
+          } \
+          b = ""; \
+        } \
+        s && !/^ *\/\// { check() } \
+        !c && !s && /^ *\/\// { s = 1; b = "" } \
+        s { b = b $0 "\n"; next } \
+        /\/\*/ { c = 1; b = "" } \
+        c { b = b $0 "\n" } \
+        c && /\*\// { c = 0; check() } \
+        END { if (s) check() }' "$f"; \
+    done < /tmp/sources > "$meta/licenses/NOTICES"; \
+    for holder in 'Broad Institute' 'Attractive Chaos' 'Yann Collet' 'Alexander Peslyak' 'Eugene Shelwien'; do \
+      grep -Fq "$holder" "$meta/licenses/NOTICES" || { echo "NOTICES lacks $holder" >&2; exit 1; }; \
+    done; \
+    grep -Fqx '==> misc/wgsim.c <==' "$meta/licenses/NOTICES" || { echo 'NOTICES lacks misc/wgsim.c' >&2; exit 1; }; \
+    echo "${VERSION}" > "$meta/version"; \
+    cp /tmp/source-url "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "source-sha256: ${SOURCE_SHA256}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      sed -n 's/^  \$ \(\.\/configure .*\)/\1/p' config.log; \
+      sed -n '2p' /tmp/samtools-version; \
+      awk '/^Samtools compilation/ { s = "samtools" } /^HTSlib compilation/ { s = "htslib" } \
+        $1 == "Features:" { $1 = ""; print s " features:" $0 }' /tmp/samtools-version; \
+      echo "config.h:$found"; \
+      printf 'programs:'; \
+      for f in /out/usr/local/bin/*; do printf ' %s' "${f##*/}"; done; \
+      echo; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local/bin -type f -exec ldd {} + > /tmp/ldd; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    for lib in libcurl libdeflate libcrypto libncursesw; do \
+      grep -q "/$lib\.so\." /tmp/libs || { echo "samtools does not load $lib" >&2; exit 1; }; \
+    done; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/samtools/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "samtools"]
+CMD ["--help"]
