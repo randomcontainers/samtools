@@ -78,7 +78,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.
   -c 'samtools index sorted.bam && bcftools mpileup -Ou -f ref.fa sorted.bam | bcftools call -mv -Oz -o calls.vcf.gz'
 ```
 
-`slim` has the programs listed above and the libraries they need, without BCFtools. Use it as the base for your own image, or when you do not call variants.
+`slim` has the programs listed above and the libraries they need, without BCFtools. Use it as the base for your own image, or when you do not call variants. The default image of [Minimap2](https://github.com/randomcontainers/minimap2) is built on `slim`, for sorting and indexing the alignments Minimap2 writes.
 
 BCFtools bundles its own copy of HTSlib, and in the default image `bgzip` and `tabix` are BCFtools' copies. When one of the two projects publishes a point release with a newer HTSlib first, these two programs are from a different HTSlib release than `samtools`, `htsfile` and `annot-tsv` until the other project catches up. `samtools --version` and `bcftools --version` print the HTSlib each was built with. BCFtools is built without GSL and perl filters, which keeps it under the MIT/Expat license. The default image is also published as `ghcr.io/randomcontainers/samtools-bcftools`, built in the [samtools-bcftools](https://github.com/randomcontainers/samtools-bcftools) repository with the same contents and a different digest.
 
